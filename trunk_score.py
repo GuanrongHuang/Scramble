@@ -61,12 +61,14 @@ def score_via_embeddings(candidates, pred_dir, binder_len, target_len):
         print(f"[trunk] {os.path.basename(ef)} keys: {list(data.keys())}",
               file=sys.stderr)
 
-        if "pair_embeddings" not in data:
-            print(f"[trunk] no pair_embeddings in {ef}", file=sys.stderr)
+       pair_key = "pair_embeddings" if "pair_embeddings" in data else "z"
+        if pair_key not in data:
+            print(f"[trunk] no pair embeddings in {ef}", file=sys.stderr)
             continue
 
-        pair = data["pair_embeddings"].astype(np.float32)  # [N, N, d_pair]
-        print(f"[trunk] pair shape: {pair.shape}", file=sys.stderr)
+        pair = data[pair_key].astype(np.float32)  # [1, N, N, d_pair] or [N, N, d_pair]
+        if pair.ndim == 4:
+            pair = pair[0]  # remove batch dim → [N, N, d_pair]
 
         if pair.shape[0] != expected or pair.shape[1] != expected:
             print(f"[trunk] shape mismatch: expected {expected}x{expected}, "
