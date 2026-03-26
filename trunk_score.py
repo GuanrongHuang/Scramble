@@ -2,31 +2,15 @@
 """
 trunk_score.py — Boltz-2 trunk scoring for candidate substitutions.
 
-Run as a subprocess from Cell 9 to avoid numpy binary incompatibility
-when importing boltz alongside gemmi/freesasa in the notebook process.
-
-Usage:
-    python trunk_score.py \
-        --pred_dir   <path_to_stage2_pred_dir> \
-        --binder_seq <sequence_string> \
-        --binder_len <int> \
-        --target_len <int> \
-        --candidates <json_string> \
-        --out        <output_json_path>
-
-Output JSON:
-    {
-        "scores": {"<design_idx>": <float>, ...},
-        "method": "pair_repr_norm" | "pae_fallback" | "fallback"
-    }
+Run as a subprocess from Cell 9 to avoid numpy binary incompatibility.
+Falls back to PAE-based scoring if trunk model loading fails.
 
 Higher score = more promising substitution candidate.
 """
 
-# ── Fix numpy binary incompatibility before any other imports ─────────────────
+# ── Fix environment before any other imports ──────────────────────────────────
 import subprocess, sys
 
-# Pin numpy and upgrade boltz to match checkpoint version
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "numpy==1.26.4", "-q", "--quiet"],
     capture_output=True
@@ -36,168 +20,164 @@ subprocess.run(
     capture_output=True
 )
 
-# Force fresh imports
-import importlib
+# Clear cached modules so fresh versions are used
 for mod in list(sys.modules.keys()):
-    if "numpy" in mod or "boltz" in mod:
+    if any(x in mod for x in ("numpy", "boltz", "torch")):
         del sys.modules[mod]
+
 # ── Standard imports ──────────────────────────────────────────────────────────
 import argparse, json, os
 import numpy as np
 
 
+def patch_boltz_for_compat():
+    """
+    Patch Boltz-2 classes to accept unknown kwargs from newer checkpoints.
+    This handles version mismatches between the installed boltz package
+    and the checkpoint file without requiring a full upgrade.
+    """
+    patches_applied = []
+
+    # Patch AtomDiffusion
+    try:
+        from boltz.model.modules.diffusion.atom_diffusion import AtomDiffusion
+        _orig = AtomDiffusion.__init__
+        def _patched_atom(self, *args, **kwargs):
+            kwargs.pop("mse_rotational_alignment", None)
+            _orig(self, *args, **kwargs)
+        AtomDiffusion.__init__ = _patched_atom
+        patches_applied.append("AtomDiffusion")
+    except Exception as e:
+        print(f"[trunk] AtomDiffusion patch failed: {e}", file=sys.stderr)
+
+    # Patch Boltz2 model itself in case it has unknown kwargs too
+    try:
+        from boltz.model.models.boltz2 import Boltz2
+        _orig2 = Boltz2.__init__
+        def _patched_boltz2(self, *args, **kwargs):
+            for k in list(kwargs.keys()):
+                try:
+                    import inspect
+                    sig = inspect.signature(_orig2)
+                    if k not in sig.parameters:
+                        kwargs.pop(k)
+                except Exception:
+                    pass
+            _orig2(self, *args, **kwargs)
+        Boltz2.__init__ = _patched_boltz2
+        patches_applied.append("Boltz2")
+    except Exception as e:
+        print(f"[trunk] Boltz2 patch failed: {e}", file=sys.stderr)
+
+    if patches_applied:
+        print(f"[trunk] patched: {patches_applied}", file=sys.stderr)
+
+
 def score_via_trunk(candidates, pred_dir, binder_seq, binder_len, target_len):
     """
-    Attempt to load Boltz-2 model and score candidates via trunk pair
-    representations. Returns (scores_dict, method_str) or raises on failure.
-
-    scores_dict: {design_idx_str: float}  — higher = more promising
+    Load Boltz-2 model and score candidates via trunk pair representations.
+    Returns (scores_dict, method_str).
+    scores_dict: {design_idx_str: float} — higher = more promising
     """
     import torch
+
+    # Apply compatibility patches before importing Boltz2
+    patch_boltz_for_compat()
+
     from boltz.model.models.boltz2 import Boltz2
 
     checkpoint = "/root/.boltz/boltz2_conf.ckpt"
     if not os.path.exists(checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
-    print(f"[trunk] loading model from {checkpoint}", file=sys.stderr)
-    model  = Boltz2.load_from_checkpoint(checkpoint)
+    print(f"[trunk] loading model...", file=sys.stderr)
+    model  = Boltz2.load_from_checkpoint(checkpoint, strict=False)
     model  = model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model  = model.to(device)
 
-    # Print top-level module names for debugging
-    top_modules = [name for name, _ in model.named_children()]
-    print(f"[trunk] top-level modules: {top_modules}", file=sys.stderr)
+    top_modules = [n for n, _ in model.named_children()]
+    print(f"[trunk] loaded. modules: {top_modules}", file=sys.stderr)
 
-    # Locate processed features written by CLI during Stage 2
-    # pred_dir is typically: .../boltz_results_X/predictions/X/
-    # processed is at:       .../boltz_results_X/processed/
-    search = pred_dir
+    # Find processed features directory
+    search    = pred_dir
     processed = None
-    for _ in range(5):
-        candidate_proc = os.path.join(search, "processed")
-        if os.path.isdir(candidate_proc):
-            processed = candidate_proc
+    for _ in range(6):
+        p = os.path.join(search, "processed")
+        if os.path.isdir(p):
+            processed = p
             break
-        parent = os.path.dirname(search)
-        if parent == search:
+        search = os.path.dirname(search)
+        if search == os.path.dirname(search):
             break
-        search = parent
-
-    # Also try sibling directory (boltz_results_X/processed)
-    if processed is None:
-        boltz_results = pred_dir
-        for _ in range(4):
-            boltz_results = os.path.dirname(boltz_results)
-            candidate_proc = os.path.join(boltz_results, "processed")
-            if os.path.isdir(candidate_proc):
-                processed = candidate_proc
-                break
 
     if processed is None:
-        raise FileNotFoundError(
-            f"Could not find processed/ directory near {pred_dir}"
-        )
-
-    print(f"[trunk] processed dir: {processed}", file=sys.stderr)
+        raise FileNotFoundError(f"processed/ dir not found near {pred_dir}")
 
     import glob, pickle
     pkl_files = glob.glob(os.path.join(processed, "mols", "*.pkl"))
     npz_files = glob.glob(os.path.join(processed, "structures", "*.npz"))
 
-    if not pkl_files:
-        raise FileNotFoundError(f"No .pkl files in {processed}/mols/")
-    if not npz_files:
-        raise FileNotFoundError(f"No .npz files in {processed}/structures/")
-
-    print(f"[trunk] pkl: {pkl_files[0]}", file=sys.stderr)
-    print(f"[trunk] npz: {npz_files[0]}", file=sys.stderr)
+    if not pkl_files or not npz_files:
+        raise FileNotFoundError(f"Missing pkl/npz in {processed}")
 
     with open(pkl_files[0], "rb") as f:
         mol_data = pickle.load(f)
     struct_data = dict(np.load(npz_files[0], allow_pickle=True))
-
-    print(f"[trunk] struct_data keys: {list(struct_data.keys())}", file=sys.stderr)
+    print(f"[trunk] struct keys: {list(struct_data.keys())}", file=sys.stderr)
 
     AA_TO_IDX = {aa: i for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWY")}
     N = binder_len + target_len
 
-    # Build parent amino acid one-hot
+    # Build parent amino acid one-hot [N, 20]
     parent_onehot = torch.zeros(N, 20, device=device)
     for i, aa in enumerate(binder_seq):
         parent_onehot[i, AA_TO_IDX.get(aa, 0)] = 1.0
 
+    def try_embed(x):
+        """Try all known embedding module names, return single repr or None."""
+        for attr in ["input_embedder", "token_embedder", "embedding",
+                     "single_embedder", "residue_embedder"]:
+            if hasattr(model, attr):
+                try:
+                    out = getattr(model, attr)(x)
+                    print(f"[trunk] embedded via {attr}", file=sys.stderr)
+                    return out
+                except Exception as e:
+                    print(f"[trunk] {attr} failed: {e}", file=sys.stderr)
+        return None
+
+    def try_pairformer(single):
+        """Try all known pairformer/trunk module names, return (single, pair) or None."""
+        for attr in ["pairformer", "trunk", "evoformer", "structure_module"]:
+            if hasattr(model, attr):
+                try:
+                    result = getattr(model, attr)(single, None)
+                    if isinstance(result, tuple) and len(result) == 2:
+                        print(f"[trunk] pairformer via {attr}", file=sys.stderr)
+                        return result
+                    result2 = getattr(model, attr)(single)
+                    if isinstance(result2, tuple) and len(result2) == 2:
+                        print(f"[trunk] pairformer via {attr} (no pair arg)",
+                              file=sys.stderr)
+                        return result2
+                except Exception as e:
+                    print(f"[trunk] {attr} failed: {e}", file=sys.stderr)
+        return None
+
     def run_trunk(onehot):
-        """
-        Try to run the pairformer trunk with the given one-hot sequence.
-        Returns cross-chain pair representation norm as IPSAE proxy, or None.
-        """
+        """Return cross-chain pair repr norm as IPSAE proxy, or None."""
         with torch.no_grad():
-            x = onehot.unsqueeze(0)  # [1, N, 20]
-
-            # Try different module name conventions
-            single = None
-
-            # Attempt 1: input_embedder
-            if hasattr(model, "input_embedder"):
-                try:
-                    single = model.input_embedder(x)
-                    print(f"[trunk] used input_embedder", file=sys.stderr)
-                except Exception as e:
-                    print(f"[trunk] input_embedder failed: {e}", file=sys.stderr)
-
-            # Attempt 2: token_embedder
-            if single is None and hasattr(model, "token_embedder"):
-                try:
-                    single = model.token_embedder(x)
-                    print(f"[trunk] used token_embedder", file=sys.stderr)
-                except Exception as e:
-                    print(f"[trunk] token_embedder failed: {e}", file=sys.stderr)
-
-            # Attempt 3: embedding
-            if single is None and hasattr(model, "embedding"):
-                try:
-                    single = model.embedding(x)
-                    print(f"[trunk] used embedding", file=sys.stderr)
-                except Exception as e:
-                    print(f"[trunk] embedding failed: {e}", file=sys.stderr)
-
+            x      = onehot.unsqueeze(0)   # [1, N, 20]
+            single = try_embed(x)
             if single is None:
-                print(f"[trunk] no embedding module found", file=sys.stderr)
                 return None
-
-            # Run pairformer / trunk
-            pair = None
-            if hasattr(model, "pairformer"):
-                try:
-                    result = model.pairformer(single, pair)
-                    if isinstance(result, tuple):
-                        single, pair = result
-                    else:
-                        single = result
-                    print(f"[trunk] used pairformer", file=sys.stderr)
-                except Exception as e:
-                    print(f"[trunk] pairformer failed: {e}", file=sys.stderr)
-
-            if pair is None and hasattr(model, "trunk"):
-                try:
-                    result = model.trunk(single)
-                    if isinstance(result, tuple):
-                        single, pair = result
-                    else:
-                        single = result
-                    print(f"[trunk] used trunk", file=sys.stderr)
-                except Exception as e:
-                    print(f"[trunk] trunk failed: {e}", file=sys.stderr)
-
-            if pair is None:
-                print(f"[trunk] no pair representation obtained", file=sys.stderr)
+            result = try_pairformer(single)
+            if result is None:
                 return None
-
-            # Cross-chain pair norm as IPSAE proxy
-            pair   = pair.squeeze(0)                           # [N, N, H]
-            cross  = pair[:binder_len, binder_len:]            # [B, T, H]
+            _, pair = result
+            pair  = pair.squeeze(0)                    # [N, N, H]
+            cross = pair[:binder_len, binder_len:]     # [B, T, H]
             return cross.norm(dim=-1).mean().item()
 
     parent_score = run_trunk(parent_onehot)
@@ -209,34 +189,26 @@ def score_via_trunk(candidates, pred_dir, binder_seq, binder_len, target_len):
     scores = {}
     for cand in candidates:
         pos     = cand["design_idx"]
-        new_aa  = cand["known_aa"]
-        new_idx = AA_TO_IDX.get(new_aa, 0)
+        new_idx = AA_TO_IDX.get(cand["known_aa"], 0)
 
-        sub_onehot = parent_onehot.clone()
-        sub_onehot[pos]         = 0.0
-        sub_onehot[pos, new_idx] = 1.0
+        sub = parent_onehot.clone()
+        sub[pos]         = 0.0
+        sub[pos, new_idx] = 1.0
 
-        sub_score = run_trunk(sub_onehot)
-        if sub_score is not None:
-            scores[str(pos)] = sub_score - parent_score
-        else:
-            scores[str(pos)] = 0.0
+        sub_score = run_trunk(sub)
+        scores[str(pos)] = (sub_score - parent_score) if sub_score is not None else 0.0
 
     return scores, "pair_repr_norm"
 
 
 def score_via_pae(candidates, pred_dir, binder_len, target_len):
     """
-    Fallback: rank candidates by per-residue cross-chain PAE.
-    Lower PAE = model more confident about interface placement = higher score.
-    Returns (scores_dict, "pae_fallback").
+    Fallback: rank by per-residue cross-chain PAE from existing .npz files.
+    Lower PAE = more confident interface placement = higher score.
     """
     import glob
 
-    pae_files = sorted(glob.glob(os.path.join(pred_dir, "pae_*.npz")))
-    if not pae_files:
-        return {str(c["design_idx"]): 0.0 for c in candidates}, "fallback"
-
+    pae_files   = sorted(glob.glob(os.path.join(pred_dir, "pae_*.npz")))
     expected    = binder_len + target_len
     accumulated = np.zeros(binder_len, dtype=np.float64)
     n_valid     = 0
@@ -244,8 +216,7 @@ def score_via_pae(candidates, pred_dir, binder_len, target_len):
     for pf in pae_files:
         data = np.load(pf)
         pae  = data["pae"] if "pae" in data else list(data.values())[0]
-        if pae.ndim == 3:
-            pae = pae[0]
+        if pae.ndim == 3: pae = pae[0]
         pae = pae.astype(np.float32)
         if pae.shape == (expected, expected):
             accumulated += pae[:binder_len, binder_len:].mean(axis=1)
@@ -255,12 +226,11 @@ def score_via_pae(candidates, pred_dir, binder_len, target_len):
         return {str(c["design_idx"]): 0.0 for c in candidates}, "fallback"
 
     cross_pae = accumulated / n_valid
-    scores    = {}
-    for cand in candidates:
-        pos = cand["design_idx"]
-        # Negate PAE so lower PAE → higher score
-        scores[str(pos)] = -float(cross_pae[pos]) if pos < len(cross_pae) else 0.0
-
+    scores    = {
+        str(c["design_idx"]): -float(cross_pae[c["design_idx"]])
+        if c["design_idx"] < len(cross_pae) else 0.0
+        for c in candidates
+    }
     return scores, "pae_fallback"
 
 
@@ -276,18 +246,16 @@ def main():
 
     candidates = json.loads(args.candidates)
 
-    # Attempt 1: full trunk scoring
+    # Attempt 1 — trunk
     try:
         scores, method = score_via_trunk(
             candidates, args.pred_dir,
             args.binder_seq, args.binder_len, args.target_len
         )
-        print(f"[trunk] trunk scoring succeeded via {method}", file=sys.stderr)
+        print(f"[trunk] succeeded via {method}", file=sys.stderr)
     except Exception as e:
         print(f"[trunk] trunk failed: {e}", file=sys.stderr)
-        print(f"[trunk] falling back to PAE scoring", file=sys.stderr)
-
-        # Attempt 2: PAE-based fallback
+        # Attempt 2 — PAE fallback
         try:
             scores, method = score_via_pae(
                 candidates, args.pred_dir,
@@ -295,18 +263,14 @@ def main():
             )
             print(f"[trunk] PAE fallback succeeded", file=sys.stderr)
         except Exception as e2:
-            print(f"[trunk] PAE fallback also failed: {e2}", file=sys.stderr)
+            print(f"[trunk] PAE fallback failed: {e2}", file=sys.stderr)
             scores = {str(c["design_idx"]): 0.0 for c in candidates}
             method = "fallback"
 
-    result = {"scores": scores, "method": method}
     with open(args.out, "w") as f:
-        json.dump(result, f)
+        json.dump({"scores": scores, "method": method}, f)
 
-    print(
-        f"[trunk] wrote {len(scores)} scores via {method}",
-        file=sys.stderr
-    )
+    print(f"[trunk] wrote {len(scores)} scores via {method}", file=sys.stderr)
 
 
 if __name__ == "__main__":
