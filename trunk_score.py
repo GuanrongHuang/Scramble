@@ -26,17 +26,21 @@ Higher score = more promising substitution candidate.
 # ── Fix numpy binary incompatibility before any other imports ─────────────────
 import subprocess, sys
 
+# Pin numpy and upgrade boltz to match checkpoint version
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "numpy==1.26.4", "-q", "--quiet"],
     capture_output=True
 )
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "boltz", "--upgrade", "-q", "--quiet"],
+    capture_output=True
+)
 
-# Force fresh numpy import with pinned version
+# Force fresh imports
 import importlib
 for mod in list(sys.modules.keys()):
-    if "numpy" in mod:
+    if "numpy" in mod or "boltz" in mod:
         del sys.modules[mod]
-
 # ── Standard imports ──────────────────────────────────────────────────────────
 import argparse, json, os
 import numpy as np
