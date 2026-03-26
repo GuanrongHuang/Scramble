@@ -2,10 +2,12 @@
 """
 trunk_score.py — Boltz-2 trunk scoring for candidate substitutions.
 
-Run as a subprocess from Cell 9 to avoid numpy binary incompatibility.
-Falls back to PAE-based scoring if trunk model loading fails.
+Confirmed module paths from boltz/src/boltz/model/models/boltz2.py:
+  from boltz.model.modules.diffusionv2 import AtomDiffusion
+  from boltz.model.modules.trunkv2 import InputEmbedder, ...
 
-Higher score = more promising substitution candidate.
+Run as subprocess from Cell 9 to avoid numpy binary incompatibility.
+Falls back to PAE-based scoring if trunk loading fails.
 """
 
 # ── Fix environment before any other imports ──────────────────────────────────
@@ -20,7 +22,7 @@ subprocess.run(
     capture_output=True
 )
 
-# Clear cached modules so fresh versions are used
+# Clear cached modules
 for mod in list(sys.modules.keys()):
     if any(x in mod for x in ("numpy", "boltz", "torch")):
         del sys.modules[mod]
@@ -30,159 +32,139 @@ import argparse, json, os
 import numpy as np
 
 
-def patch_boltz_for_compat():
+def patch_atom_diffusion():
     """
-    Patch Boltz-2 classes to accept unknown kwargs from newer checkpoints.
-    This handles version mismatches between the installed boltz package
-    and the checkpoint file without requiring a full upgrade.
+    Patch AtomDiffusion to accept unknown kwargs from newer checkpoints.
+    Correct import path confirmed from boltz source:
+        from boltz.model.modules.diffusionv2 import AtomDiffusion
     """
-    patches_applied = []
-
-    # Patch AtomDiffusion
     try:
-        from boltz.model.modules.diffusion.atom_diffusion import AtomDiffusion
+        from boltz.model.modules.diffusionv2 import AtomDiffusion
         _orig = AtomDiffusion.__init__
-        def _patched_atom(self, *args, **kwargs):
+
+        def _patched(self, *args, **kwargs):
             kwargs.pop("mse_rotational_alignment", None)
             _orig(self, *args, **kwargs)
-        AtomDiffusion.__init__ = _patched_atom
-        patches_applied.append("AtomDiffusion")
+
+        AtomDiffusion.__init__ = _patched
+        print("[trunk] patched AtomDiffusion (diffusionv2)", file=sys.stderr)
+        return True
     except Exception as e:
         print(f"[trunk] AtomDiffusion patch failed: {e}", file=sys.stderr)
+        return False
 
-    # Patch Boltz2 model itself in case it has unknown kwargs too
+
+def load_model_safe(checkpoint):
+    """
+    Load Boltz-2 model safely, handling version mismatches.
+    Uses strict=False so missing/extra keys are ignored.
+    Patches AtomDiffusion before instantiation.
+    """
+    import torch
+
+    patch_atom_diffusion()
+
+    from boltz.model.models.boltz2 import Boltz2
+
+    # Load checkpoint dict directly to inspect hparams
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    print(f"[trunk] checkpoint keys: {list(ckpt.keys())}", file=sys.stderr)
+
+    # Extract hyper_parameters and remove unknown ones
+    hparams = ckpt.get("hyper_parameters", {})
+    known_issues = ["mse_rotational_alignment"]
+    for key in known_issues:
+        if key in hparams:
+            print(f"[trunk] removing unknown hparam: {key}", file=sys.stderr)
+            del hparams[key]
+    ckpt["hyper_parameters"] = hparams
+
+    # Save cleaned checkpoint to temp file and load from there
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False) as tmp:
+        tmp_path = tmp.name
+    torch.save(ckpt, tmp_path)
+
     try:
-        from boltz.model.models.boltz2 import Boltz2
-        _orig2 = Boltz2.__init__
-        def _patched_boltz2(self, *args, **kwargs):
-            for k in list(kwargs.keys()):
-                try:
-                    import inspect
-                    sig = inspect.signature(_orig2)
-                    if k not in sig.parameters:
-                        kwargs.pop(k)
-                except Exception:
-                    pass
-            _orig2(self, *args, **kwargs)
-        Boltz2.__init__ = _patched_boltz2
-        patches_applied.append("Boltz2")
-    except Exception as e:
-        print(f"[trunk] Boltz2 patch failed: {e}", file=sys.stderr)
+        model = Boltz2.load_from_checkpoint(tmp_path, strict=False)
+        print("[trunk] model loaded successfully", file=sys.stderr)
+    finally:
+        try: os.unlink(tmp_path)
+        except: pass
 
-    if patches_applied:
-        print(f"[trunk] patched: {patches_applied}", file=sys.stderr)
+    return model
 
 
 def score_via_trunk(candidates, pred_dir, binder_seq, binder_len, target_len):
     """
-    Load Boltz-2 model and score candidates via trunk pair representations.
+    Score candidates via Boltz-2 trunk InputEmbedder + pairformer.
     Returns (scores_dict, method_str).
-    scores_dict: {design_idx_str: float} — higher = more promising
     """
     import torch
-
-    # Apply compatibility patches before importing Boltz2
-    patch_boltz_for_compat()
-
-    from boltz.model.models.boltz2 import Boltz2
 
     checkpoint = "/root/.boltz/boltz2_conf.ckpt"
     if not os.path.exists(checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
-    print(f"[trunk] loading model...", file=sys.stderr)
-    model  = Boltz2.load_from_checkpoint(checkpoint, strict=False)
+    model  = load_model_safe(checkpoint)
     model  = model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model  = model.to(device)
 
-    top_modules = [n for n, _ in model.named_children()]
-    print(f"[trunk] loaded. modules: {top_modules}", file=sys.stderr)
+    # Print available modules for debugging
+    children = {n: type(m).__name__ for n, m in model.named_children()}
+    print(f"[trunk] modules: {children}", file=sys.stderr)
 
-    # Find processed features directory
-    search    = pred_dir
-    processed = None
-    for _ in range(6):
-        p = os.path.join(search, "processed")
-        if os.path.isdir(p):
-            processed = p
-            break
-        search = os.path.dirname(search)
-        if search == os.path.dirname(search):
+    # Locate InputEmbedder — confirmed name from trunkv2
+    embedder = None
+    for attr in ["input_embedder", "InputEmbedder", "embedder"]:
+        if hasattr(model, attr):
+            embedder = getattr(model, attr)
+            print(f"[trunk] found embedder: {attr}", file=sys.stderr)
             break
 
-    if processed is None:
-        raise FileNotFoundError(f"processed/ dir not found near {pred_dir}")
+    # Locate pairformer trunk — confirmed from trunkv2
+    pairformer = None
+    for attr in ["pairformer", "trunk", "pairformer_stack"]:
+        if hasattr(model, attr):
+            pairformer = getattr(model, attr)
+            print(f"[trunk] found pairformer: {attr}", file=sys.stderr)
+            break
 
-    import glob, pickle
-    pkl_files = glob.glob(os.path.join(processed, "mols", "*.pkl"))
-    npz_files = glob.glob(os.path.join(processed, "structures", "*.npz"))
-
-    if not pkl_files or not npz_files:
-        raise FileNotFoundError(f"Missing pkl/npz in {processed}")
-
-    with open(pkl_files[0], "rb") as f:
-        mol_data = pickle.load(f)
-    struct_data = dict(np.load(npz_files[0], allow_pickle=True))
-    print(f"[trunk] struct keys: {list(struct_data.keys())}", file=sys.stderr)
+    if embedder is None or pairformer is None:
+        raise RuntimeError(
+            f"Could not find embedder or pairformer. "
+            f"Available: {list(children.keys())}"
+        )
 
     AA_TO_IDX = {aa: i for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWY")}
     N = binder_len + target_len
 
-    # Build parent amino acid one-hot [N, 20]
+    # Build parent one-hot [N, 20]
     parent_onehot = torch.zeros(N, 20, device=device)
     for i, aa in enumerate(binder_seq):
         parent_onehot[i, AA_TO_IDX.get(aa, 0)] = 1.0
 
-    def try_embed(x):
-        """Try all known embedding module names, return single repr or None."""
-        for attr in ["input_embedder", "token_embedder", "embedding",
-                     "single_embedder", "residue_embedder"]:
-            if hasattr(model, attr):
-                try:
-                    out = getattr(model, attr)(x)
-                    print(f"[trunk] embedded via {attr}", file=sys.stderr)
-                    return out
-                except Exception as e:
-                    print(f"[trunk] {attr} failed: {e}", file=sys.stderr)
-        return None
-
-    def try_pairformer(single):
-        """Try all known pairformer/trunk module names, return (single, pair) or None."""
-        for attr in ["pairformer", "trunk", "evoformer", "structure_module"]:
-            if hasattr(model, attr):
-                try:
-                    result = getattr(model, attr)(single, None)
-                    if isinstance(result, tuple) and len(result) == 2:
-                        print(f"[trunk] pairformer via {attr}", file=sys.stderr)
-                        return result
-                    result2 = getattr(model, attr)(single)
-                    if isinstance(result2, tuple) and len(result2) == 2:
-                        print(f"[trunk] pairformer via {attr} (no pair arg)",
-                              file=sys.stderr)
-                        return result2
-                except Exception as e:
-                    print(f"[trunk] {attr} failed: {e}", file=sys.stderr)
-        return None
-
     def run_trunk(onehot):
-        """Return cross-chain pair repr norm as IPSAE proxy, or None."""
         with torch.no_grad():
-            x      = onehot.unsqueeze(0)   # [1, N, 20]
-            single = try_embed(x)
-            if single is None:
+            try:
+                x      = onehot.unsqueeze(0)          # [1, N, 20]
+                single = embedder(x)
+                result = pairformer(single, None)
+                if isinstance(result, tuple):
+                    _, pair = result
+                else:
+                    return None
+                pair  = pair.squeeze(0)               # [N, N, H]
+                cross = pair[:binder_len, binder_len:]# [B, T, H]
+                return cross.norm(dim=-1).mean().item()
+            except Exception as e:
+                print(f"[trunk] forward pass failed: {e}", file=sys.stderr)
                 return None
-            result = try_pairformer(single)
-            if result is None:
-                return None
-            _, pair = result
-            pair  = pair.squeeze(0)                    # [N, N, H]
-            cross = pair[:binder_len, binder_len:]     # [B, T, H]
-            return cross.norm(dim=-1).mean().item()
 
     parent_score = run_trunk(parent_onehot)
     if parent_score is None:
-        raise RuntimeError("Trunk returned no pair representation")
+        raise RuntimeError("Trunk forward pass returned None")
 
     print(f"[trunk] parent_score={parent_score:.6f}", file=sys.stderr)
 
@@ -196,7 +178,9 @@ def score_via_trunk(candidates, pred_dir, binder_seq, binder_len, target_len):
         sub[pos, new_idx] = 1.0
 
         sub_score = run_trunk(sub)
-        scores[str(pos)] = (sub_score - parent_score) if sub_score is not None else 0.0
+        scores[str(pos)] = (
+            float(sub_score - parent_score) if sub_score is not None else 0.0
+        )
 
     return scores, "pair_repr_norm"
 
@@ -246,7 +230,7 @@ def main():
 
     candidates = json.loads(args.candidates)
 
-    # Attempt 1 — trunk
+    # Attempt 1: trunk
     try:
         scores, method = score_via_trunk(
             candidates, args.pred_dir,
@@ -255,7 +239,7 @@ def main():
         print(f"[trunk] succeeded via {method}", file=sys.stderr)
     except Exception as e:
         print(f"[trunk] trunk failed: {e}", file=sys.stderr)
-        # Attempt 2 — PAE fallback
+        # Attempt 2: PAE fallback
         try:
             scores, method = score_via_pae(
                 candidates, args.pred_dir,
