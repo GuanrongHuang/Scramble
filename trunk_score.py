@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
 """
-trunk_score.py — Boltz-2 trunk scoring using official --write_embeddings output.
+trunk_score.py — Boltz-2 trunk scoring combining z embeddings and PAE.
 
-Boltz-2 CLI --write_embeddings writes to:
-  <pred_dir>/embeddings_<name>.npz
+Confirmed file outputs from boltz --write_embeddings --write_full_pae:
+  embeddings_<name>.npz  → keys: s [1,N,384], z [1,N,N,128]
+  pae_<name>_model_N.npz → key: pae [N,N]
 
-Confirmed keys (from live inspection):
-  s: [1, N, 384]       — per-token single representations
-  z: [1, N, N, 128]    — per-token-pair representations
+Combined score per binder residue:
+  z_score   = mean(norm(z[:binder_len, binder_len:], axis=-1), axis=1)
+              Higher = stronger trunk interface encoding at this position.
 
-We use cross-chain z norm as IPSAE proxy:
-  z[0, :binder_len, binder_len:].norm(axis=-1).mean(axis=1)
-  Higher = stronger predicted interface signal per binder residue.
+  pae_score = -mean(pae[:binder_len, binder_len:], axis=1)
+              Higher (less negative) = more confident interface placement.
 
-Falls back to PAE-based scoring if embeddings not found.
+Both are normalised to [0,1] within the design and combined:
+  combined = 0.5 * z_norm + 0.5 * pae_norm
+
+This answers two complementary questions:
+  z   → how much did the pairformer encode this position's interface relationship?
+  PAE → how confidently does the model place this position relative to the target?
+
+A position scoring high on both is genuinely interfacial AND confidently placed
+— the strongest signal for prioritising grafting substitutions.
 """
 
 import argparse, json, os, sys
 import numpy as np
 
 
-def score_via_embeddings(candidates, pred_dir, binder_len, target_len):
+def load_z_scores(pred_dir, binder_len, target_len):
+    """
+    Load cross-chain z norm per binder residue from embeddings_*.npz.
+    Returns [binder_len] float array, or None if not available.
+    """
     import glob
 
     emb_files = sorted(glob.glob(os.path.join(pred_dir, "embeddings_*.npz")))
     if not emb_files:
-        raise FileNotFoundError(f"No embeddings_*.npz in {pred_dir}")
-
-    print(f"[trunk] found {len(emb_files)} embeddings file(s)", file=sys.stderr)
+        return None
 
     expected    = binder_len + target_len
     accumulated = np.zeros(binder_len, dtype=np.float64)
@@ -35,51 +45,40 @@ def score_via_embeddings(candidates, pred_dir, binder_len, target_len):
 
     for ef in emb_files:
         data = np.load(ef)
-        print(f"[trunk] keys: {list(data.keys())}", file=sys.stderr)
 
-        # Confirmed key is 'z', fallback to 'pair_embeddings'
         if "z" in data:
             pair = data["z"].astype(np.float32)
         elif "pair_embeddings" in data:
             pair = data["pair_embeddings"].astype(np.float32)
         else:
-            print(f"[trunk] no z or pair_embeddings in {ef}", file=sys.stderr)
             continue
 
-        # Remove batch dimension if present
         if pair.ndim == 4:
-            pair = pair[0]  # [N, N, d_pair]
-
-        print(f"[trunk] pair shape after squeeze: {pair.shape}", file=sys.stderr)
+            pair = pair[0]
 
         if pair.shape[0] != expected or pair.shape[1] != expected:
-            print(f"[trunk] shape mismatch: expected {expected}, got {pair.shape[0]}",
-                  file=sys.stderr)
             continue
 
-        cross      = pair[:binder_len, binder_len:]       # [B, T, d_pair]
-        cross_norm = np.linalg.norm(cross, axis=-1)       # [B, T]
-        accumulated += cross_norm.mean(axis=1)            # [B]
+        cross      = pair[:binder_len, binder_len:]   # [B, T, 128]
+        cross_norm = np.linalg.norm(cross, axis=-1)   # [B, T]
+        accumulated += cross_norm.mean(axis=1)        # [B]
         n_valid += 1
 
     if n_valid == 0:
-        raise ValueError("No valid embeddings with correct shape")
+        return None
 
-    per_residue = accumulated / n_valid
-    print(f"[trunk] score range: [{per_residue.min():.4f}, {per_residue.max():.4f}]",
+    scores = accumulated / n_valid
+    print(f"[trunk] z_score range: [{scores.min():.3f}, {scores.max():.3f}]",
           file=sys.stderr)
-
-    scores = {}
-    for cand in candidates:
-        pos = cand["design_idx"]
-        scores[str(pos)] = float(per_residue[pos]) if pos < len(per_residue) else 0.0
-        print(f"[trunk] pos {pos} {cand['design_aa']}→{cand['known_aa']}: "
-              f"{scores[str(pos)]:.4f}", file=sys.stderr)
-
-    return scores, "pair_emb_norm"
+    return scores
 
 
-def score_via_pae(candidates, pred_dir, binder_len, target_len):
+def load_pae_scores(pred_dir, binder_len, target_len):
+    """
+    Load mean cross-chain PAE per binder residue from pae_*.npz.
+    Returns [binder_len] float array of negated PAE (higher = more confident).
+    Returns None if not available.
+    """
     import glob
 
     pae_files   = sorted(glob.glob(os.path.join(pred_dir, "pae_*.npz")))
@@ -97,15 +96,42 @@ def score_via_pae(candidates, pred_dir, binder_len, target_len):
             n_valid += 1
 
     if n_valid == 0:
-        return {str(c["design_idx"]): 0.0 for c in candidates}, "fallback"
+        return None
 
-    cross_pae = accumulated / n_valid
-    scores = {
-        str(c["design_idx"]): -float(cross_pae[c["design_idx"]])
-        if c["design_idx"] < len(cross_pae) else 0.0
-        for c in candidates
-    }
-    return scores, "pae_fallback"
+    # Negate so higher = more confident (lower PAE = better)
+    scores = -(accumulated / n_valid)
+    print(f"[trunk] pae_score range: [{scores.min():.3f}, {scores.max():.3f}]",
+          file=sys.stderr)
+    return scores
+
+
+def normalise(arr):
+    """Normalise array to [0, 1]. Returns uniform 0.5 if all values identical."""
+    mn, mx = arr.min(), arr.max()
+    if mx - mn < 1e-8:
+        return np.full_like(arr, 0.5)
+    return (arr - mn) / (mx - mn)
+
+
+def combine_scores(z_scores, pae_scores):
+    """
+    Combine z norm and PAE scores into a single per-residue score.
+    Both are normalised to [0,1] first so neither dominates.
+    """
+    if z_scores is not None and pae_scores is not None:
+        combined = 0.5 * normalise(z_scores) + 0.5 * normalise(pae_scores)
+        method   = "z_pae_combined"
+    elif z_scores is not None:
+        combined = normalise(z_scores)
+        method   = "pair_emb_norm"
+    elif pae_scores is not None:
+        combined = normalise(pae_scores)
+        method   = "pae_fallback"
+    else:
+        combined = None
+        method   = "fallback"
+
+    return combined, method
 
 
 def main():
@@ -118,26 +144,32 @@ def main():
     parser.add_argument("--out",         required=True)
     args = parser.parse_args()
 
-    candidates = json.loads(args.candidates)
+    candidates  = json.loads(args.candidates)
+    binder_len  = args.binder_len
+    target_len  = args.target_len
 
-    try:
-        scores, method = score_via_embeddings(
-            candidates, args.pred_dir,
-            args.binder_len, args.target_len
-        )
-        print(f"[trunk] succeeded via {method}", file=sys.stderr)
-    except Exception as e:
-        print(f"[trunk] embeddings failed: {e}", file=sys.stderr)
-        try:
-            scores, method = score_via_pae(
-                candidates, args.pred_dir,
-                args.binder_len, args.target_len
-            )
-            print(f"[trunk] PAE fallback succeeded", file=sys.stderr)
-        except Exception as e2:
-            print(f"[trunk] PAE fallback failed: {e2}", file=sys.stderr)
-            scores = {str(c["design_idx"]): 0.0 for c in candidates}
-            method = "fallback"
+    # Load both signals independently
+    z_scores   = load_z_scores(args.pred_dir, binder_len, target_len)
+    pae_scores = load_pae_scores(args.pred_dir, binder_len, target_len)
+
+    combined, method = combine_scores(z_scores, pae_scores)
+
+    if combined is not None:
+        scores = {}
+        for cand in candidates:
+            pos = cand["design_idx"]
+            scores[str(pos)] = float(combined[pos]) if pos < len(combined) else 0.0
+            z_str   = f"{z_scores[pos]:.2f}"   if z_scores   is not None else "N/A"
+            pae_str = f"{-pae_scores[pos]:.2f}" if pae_scores is not None else "N/A"
+            print(f"[trunk] pos {pos} {cand['design_aa']}→{cand['known_aa']}: "
+                  f"combined={scores[str(pos)]:.4f}  z={z_str}  pae={pae_str}",
+                  file=sys.stderr)
+    else:
+        print("[trunk] no scoring signals available — using zero scores",
+              file=sys.stderr)
+        scores = {str(c["design_idx"]): 0.0 for c in candidates}
+
+    print(f"[trunk] method: {method}", file=sys.stderr)
 
     with open(args.out, "w") as f:
         json.dump({"scores": scores, "method": method}, f)
