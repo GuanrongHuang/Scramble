@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-trunk_score.py — Boltz-2 trunk scoring combining z embeddings and PAE.
+trunk_score.py — Boltz-2 trunk scoring using z embeddings only.
 
 Confirmed file outputs from boltz --write_embeddings --write_full_pae:
   embeddings_<name>.npz  → keys: s [1,N,384], z [1,N,N,128]
   pae_<name>_model_N.npz → key: pae [N,N]
 
-Combined score per binder residue:
+Active score:
   z_score   = mean(norm(z[:binder_len, binder_len:], axis=-1), axis=1)
               Higher = stronger trunk interface encoding at this position.
 
+Inactive (preserved for future use):
   pae_score = -mean(pae[:binder_len, binder_len:], axis=1)
               Higher (less negative) = more confident interface placement.
+              Disabled: empirically produced inferior IPSAE outcomes vs z-only.
 
-Both are normalised to [0,1] within the design and combined:
-  combined = 0.5 * z_norm + 0.5 * pae_norm
-
-This answers two complementary questions:
-  z   → how much did the pairformer encode this position's interface relationship?
-  PAE → how confidently does the model place this position relative to the target?
-
-A position scoring high on both is genuinely interfacial AND confidently placed
-— the strongest signal for prioritising grafting substitutions.
+z is normalised to [0,1] and used as the sole ranking signal.
+A position scoring high on z is one the pairformer strongly encoded as
+interfacial — the most direct signal for prioritising grafting substitutions.
 """
 
 import argparse, json, os, sys
@@ -78,6 +74,9 @@ def load_pae_scores(pred_dir, binder_len, target_len):
     Load mean cross-chain PAE per binder residue from pae_*.npz.
     Returns [binder_len] float array of negated PAE (higher = more confident).
     Returns None if not available.
+
+    NOTE: Currently not used in combine_scores — preserved for future use.
+    Empirically produced inferior IPSAE outcomes vs z-only ranking.
     """
     import glob
 
@@ -115,16 +114,16 @@ def normalise(arr):
 
 def combine_scores(z_scores, pae_scores):
     """
-    Combine z norm and PAE scores into a single per-residue score.
-    Both are normalised to [0,1] first so neither dominates.
+    Rank candidates by z score only.
+    PAE is loaded and printed for diagnostics but does not contribute to ranking.
+    Revert reason: PAE combination produced inferior IPSAE scores vs z-only.
+    To re-enable PAE: change to 0.5 * normalise(z_scores) + 0.5 * normalise(pae_scores)
     """
-    if z_scores is not None and pae_scores is not None:
-        combined = 0.5 * normalise(z_scores) + 0.5 * normalise(pae_scores)
-        method   = "z_pae_combined"
-    elif z_scores is not None:
+    if z_scores is not None:
         combined = normalise(z_scores)
         method   = "pair_emb_norm"
     elif pae_scores is not None:
+        # Pure fallback — z embeddings unavailable
         combined = normalise(pae_scores)
         method   = "pae_fallback"
     else:
@@ -148,7 +147,7 @@ def main():
     binder_len  = args.binder_len
     target_len  = args.target_len
 
-    # Load both signals independently
+    # Load both signals — PAE loaded for diagnostics even though not used in ranking
     z_scores   = load_z_scores(args.pred_dir, binder_len, target_len)
     pae_scores = load_pae_scores(args.pred_dir, binder_len, target_len)
 
@@ -159,7 +158,7 @@ def main():
         for cand in candidates:
             pos = cand["design_idx"]
             scores[str(pos)] = float(combined[pos]) if pos < len(combined) else 0.0
-            z_str   = f"{z_scores[pos]:.2f}"   if z_scores   is not None else "N/A"
+            z_str   = f"{z_scores[pos]:.2f}"    if z_scores   is not None else "N/A"
             pae_str = f"{-pae_scores[pos]:.2f}" if pae_scores is not None else "N/A"
             print(f"[trunk] pos {pos} {cand['design_aa']}→{cand['known_aa']}: "
                   f"combined={scores[str(pos)]:.4f}  z={z_str}  pae={pae_str}",
