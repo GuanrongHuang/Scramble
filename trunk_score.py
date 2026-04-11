@@ -25,7 +25,7 @@ Scoring formula per binder residue:
                     Complement to PAE for contact geometry confidence.
 
 Combined:
-  combined = 0.7 * z_norm + 0.3 * (1 - plddt_norm)
+  combined = normalise(z_norm)  (z-only, empirically best)
 
   PDE is loaded and printed for diagnostics but not yet in the formula.
   PAE is loaded and printed for diagnostics but not in the formula
@@ -135,7 +135,7 @@ def load_plddt_variance(pred_dir, binder_len, target_len):
     """
     Mean per-residue pLDDT across diffusion samples for binder residues.
     Lower mean pLDDT = more disordered = better substitution target.
-    Combined with z as: 0.70 * z + 0.30 * (1 - plddt_norm).
+    Combined with z as: 0.60 * z + 0.40 * (1 - plddt_norm).
     Returns float32 [binder_len] or None.
     Note: variable name kept as load_plddt_variance for API compatibility;
     now computes mean rather than variance.
@@ -263,12 +263,10 @@ def normalise(arr):
 
 def combine_scores(z_scores, s_scores, plddt_var, pde_scores, pae_scores):
     """
-    Combined score:
-      0.70 * z_norm          (primary: pairformer interface encoding)
-      0.30 * (1 - plddt_norm) (flexibility: low pLDDT = disordered = good substitution target)
-
-    s, PDE and PAE are loaded and printed for diagnostics but not in the formula.
-    Falls back to z-only if mean pLDDT is unavailable.
+    z-only score: normalise(z_norm).
+    Empirically best — PAE and pLDDT both degraded IPSAE outcomes when added.
+    s, pLDDT, PDE and PAE are still loaded and printed to stderr for diagnostics.
+    Falls back through s -> pae -> zeros if z is unavailable.
     """
     if z_scores is None:
         # z unavailable — fall back through available signals
@@ -278,16 +276,8 @@ def combine_scores(z_scores, s_scores, plddt_var, pde_scores, pae_scores):
             return normalise(pae_scores), "pae_fallback"
         return None, "fallback"
 
-    if plddt_var is not None:
-        # Use mean pLDDT across samples rather than variance —
-        # low mean pLDDT = disordered = good substitution target,
-        # so we invert: score = 1 - normalise(mean_plddt)
-        combined = 0.70 * normalise(z_scores) + 0.30 * (1.0 - normalise(plddt_var))
-        method   = "z_plddt_combined"
-    else:
-        combined = normalise(z_scores)
-        method   = "pair_emb_norm"
-
+    combined = normalise(z_scores)
+    method   = "pair_emb_norm"
     return combined.astype(np.float32), method
 
 
