@@ -1,36 +1,50 @@
 #!/usr/bin/env python3
 """
-trunk_score.py — Boltz-2 trunk scoring using z embeddings only.
+trunk_score.py — Boltz-2 trunk scoring using z, s, pLDDT variance, and PDE.
 
 Confirmed file outputs from boltz --write_embeddings --write_full_pae:
-  embeddings_<name>.npz  → keys: s [1,N,384], z [1,N,N,128]
-  pae_<name>_model_N.npz → key: pae [N,N]
+  embeddings_<name>.npz       -> keys: s [1,N,384], z [1,N,N,128]
+  plddt_<name>_model_N.npz    -> key: plddt [N]
+  pae_<name>_model_N.npz      -> key: pae [N,N]
+  pde_<name>_model_N.npz      -> key: pde [N,N]
 
-Active score:
-  z_score   = mean(norm(z[:binder_len, binder_len:], axis=-1), axis=1)
-              Higher = stronger trunk interface encoding at this position.
+Scoring formula per binder residue:
+  z_score         = mean(norm(z[0, :binder_len, binder_len:], axis=-1), axis=1)
+                    Higher = stronger pairformer interface encoding.
+                    Literature: z encodes residue-residue interactions (Boltz-2 paper).
 
-Inactive (preserved for future use):
-  pae_score = -mean(pae[:binder_len, binder_len:], axis=1)
-              Higher (less negative) = more confident interface placement.
-              Disabled: empirically produced inferior IPSAE outcomes vs z-only.
+  s_score         = norm(s[0, :binder_len, :], axis=-1)
+                    Higher = higher predicted flexibility/disorder (B-factor proxy).
+                    Literature: s single representation supervised on B-factors (Boltz-2 paper).
 
-z is normalised to [0,1] and used as the sole ranking signal.
-A position scoring high on z is one the pairformer strongly encoded as
-interfacial — the most direct signal for prioritising grafting substitutions.
+  plddt_var_score = variance of plddt[:binder_len] across 6 diffusion samples per position.
+                    Higher = more structurally uncertain across samples = better substitution target.
+
+  pde_score       = -mean(pde[0, :binder_len, binder_len:], axis=1)
+                    Higher (less negative) = more confident interface distance geometry.
+                    Complement to PAE for contact geometry confidence.
+
+Combined:
+  combined = 0.6 * z_norm + 0.4 * (1 - plddt_norm)
+
+  PDE is loaded and printed for diagnostics but not yet in the formula.
+  PAE is loaded and printed for diagnostics but not in the formula
+  (empirically produced inferior IPSAE outcomes vs z-only).
+
+All signals normalised to [0,1] within the design before combining.
 """
 
-import argparse, json, os, sys
+import argparse, glob, json, os, sys
 import numpy as np
 
 
+# ── Signal loaders ────────────────────────────────────────────────────────────
+
 def load_z_scores(pred_dir, binder_len, target_len):
     """
-    Load cross-chain z norm per binder residue from embeddings_*.npz.
-    Returns [binder_len] float array, or None if not available.
+    Cross-chain z norm per binder residue from embeddings_*.npz.
+    Returns float32 [binder_len] or None.
     """
-    import glob
-
     emb_files = sorted(glob.glob(os.path.join(pred_dir, "embeddings_*.npz")))
     if not emb_files:
         return None
@@ -40,7 +54,11 @@ def load_z_scores(pred_dir, binder_len, target_len):
     n_valid     = 0
 
     for ef in emb_files:
-        data = np.load(ef)
+        try:
+            data = np.load(ef)
+        except Exception as e:
+            print(f"[trunk] warn: could not load {ef}: {e}", file=sys.stderr)
+            continue
 
         if "z" in data:
             pair = data["z"].astype(np.float32)
@@ -50,119 +68,278 @@ def load_z_scores(pred_dir, binder_len, target_len):
             continue
 
         if pair.ndim == 4:
-            pair = pair[0]
+            pair = pair[0]   # [N, N, 128]
 
         if pair.shape[0] != expected or pair.shape[1] != expected:
             continue
 
-        cross      = pair[:binder_len, binder_len:]   # [B, T, 128]
-        cross_norm = np.linalg.norm(cross, axis=-1)   # [B, T]
-        accumulated += cross_norm.mean(axis=1)        # [B]
+        cross      = pair[:binder_len, binder_len:]        # [B, T, 128]
+        cross_norm = np.linalg.norm(cross, axis=-1)        # [B, T]
+        accumulated += cross_norm.mean(axis=1)             # [B]
         n_valid += 1
 
     if n_valid == 0:
         return None
 
-    scores = accumulated / n_valid
+    scores = (accumulated / n_valid).astype(np.float32)
     print(f"[trunk] z_score range: [{scores.min():.3f}, {scores.max():.3f}]",
+          file=sys.stderr)
+    return scores
+
+
+def load_s_scores(pred_dir, binder_len, target_len):
+    """
+    s norm per binder residue from embeddings_*.npz.
+    s is supervised on B-factors in Boltz-2 training — proxy for flexibility.
+    Returns float32 [binder_len] or None.
+    """
+    emb_files = sorted(glob.glob(os.path.join(pred_dir, "embeddings_*.npz")))
+    if not emb_files:
+        return None
+
+    expected    = binder_len + target_len
+    accumulated = np.zeros(binder_len, dtype=np.float64)
+    n_valid     = 0
+
+    for ef in emb_files:
+        try:
+            data = np.load(ef)
+        except Exception as e:
+            print(f"[trunk] warn: could not load {ef}: {e}", file=sys.stderr)
+            continue
+
+        if "s" not in data:
+            continue
+
+        single = data["s"].astype(np.float32)   # [1, N, 384] or [N, 384]
+        if single.ndim == 3:
+            single = single[0]                   # [N, 384]
+
+        if single.shape[0] != expected:
+            continue
+
+        s_norm = np.linalg.norm(single[:binder_len, :], axis=-1)  # [B]
+        accumulated += s_norm
+        n_valid += 1
+
+    if n_valid == 0:
+        return None
+
+    scores = (accumulated / n_valid).astype(np.float32)
+    print(f"[trunk] s_score range: [{scores.min():.3f}, {scores.max():.3f}]",
+          file=sys.stderr)
+    return scores
+
+
+def load_plddt_variance(pred_dir, binder_len, target_len):
+    """
+    Mean per-residue pLDDT across diffusion samples for binder residues.
+    Lower mean pLDDT = more disordered = better substitution target.
+    Combined with z as: 0.60 * z + 0.40 * (1 - plddt_norm).
+    Returns float32 [binder_len] or None.
+    Note: variable name kept as load_plddt_variance for API compatibility;
+    now computes mean rather than variance.
+    """
+    plddt_files = sorted(glob.glob(os.path.join(pred_dir, "plddt_*.npz")))
+    if not plddt_files:
+        return None
+
+    expected    = binder_len + target_len
+    accumulated = np.zeros(binder_len, dtype=np.float64)
+    n_valid     = 0
+
+    for pf in plddt_files:
+        try:
+            data  = np.load(pf)
+            plddt = data["plddt"].astype(np.float32)   # [N]
+        except Exception as e:
+            print(f"[trunk] warn: could not load {pf}: {e}", file=sys.stderr)
+            continue
+
+        if plddt.shape[0] != expected:
+            continue
+
+        accumulated += plddt[:binder_len]
+        n_valid += 1
+
+    if n_valid == 0:
+        return None
+
+    scores = (accumulated / n_valid).astype(np.float32)
+    print(f"[trunk] mean_plddt range: [{scores.min():.3f}, {scores.max():.3f}]",
+          file=sys.stderr)
+    return scores
+
+
+def load_pde_scores(pred_dir, binder_len, target_len):
+    """
+    Cross-chain mean PDE (predicted distance error) per binder residue.
+    Loaded for diagnostics — not currently in the combined formula.
+    Returns float32 [binder_len] or None.
+    """
+    pde_files   = sorted(glob.glob(os.path.join(pred_dir, "pde_*.npz")))
+    if not pde_files:
+        return None
+
+    expected    = binder_len + target_len
+    accumulated = np.zeros(binder_len, dtype=np.float64)
+    n_valid     = 0
+
+    for pf in pde_files:
+        try:
+            data = np.load(pf)
+            pde  = data["pde"].astype(np.float32)   # [N, N]
+        except Exception as e:
+            print(f"[trunk] warn: could not load {pf}: {e}", file=sys.stderr)
+            continue
+
+        if pde.shape != (expected, expected):
+            continue
+
+        accumulated += pde[:binder_len, binder_len:].mean(axis=1)
+        n_valid += 1
+
+    if n_valid == 0:
+        return None
+
+    scores = -(accumulated / n_valid).astype(np.float32)   # negate: lower PDE = better
+    print(f"[trunk] pde_score range: [{scores.min():.3f}, {scores.max():.3f}]",
           file=sys.stderr)
     return scores
 
 
 def load_pae_scores(pred_dir, binder_len, target_len):
     """
-    Load mean cross-chain PAE per binder residue from pae_*.npz.
-    Returns [binder_len] float array of negated PAE (higher = more confident).
-    Returns None if not available.
-
-    NOTE: Currently not used in combine_scores — preserved for future use.
-    Empirically produced inferior IPSAE outcomes vs z-only ranking.
+    Cross-chain mean PAE per binder residue.
+    Loaded for diagnostics only — disabled from formula.
+    Empirically produced inferior IPSAE outcomes vs z-only.
+    Returns float32 [binder_len] or None.
     """
-    import glob
-
     pae_files   = sorted(glob.glob(os.path.join(pred_dir, "pae_*.npz")))
+    if not pae_files:
+        return None
+
     expected    = binder_len + target_len
     accumulated = np.zeros(binder_len, dtype=np.float64)
     n_valid     = 0
 
     for pf in pae_files:
-        data = np.load(pf)
-        pae  = data["pae"] if "pae" in data else list(data.values())[0]
-        if pae.ndim == 3: pae = pae[0]
-        pae = pae.astype(np.float32)
-        if pae.shape == (expected, expected):
-            accumulated += pae[:binder_len, binder_len:].mean(axis=1)
-            n_valid += 1
+        try:
+            data = np.load(pf)
+            pae  = data["pae"] if "pae" in data else list(data.values())[0]
+            if pae.ndim == 3:
+                pae = pae[0]
+            pae = pae.astype(np.float32)
+        except Exception as e:
+            print(f"[trunk] warn: could not load {pf}: {e}", file=sys.stderr)
+            continue
+
+        if pae.shape != (expected, expected):
+            continue
+
+        accumulated += pae[:binder_len, binder_len:].mean(axis=1)
+        n_valid += 1
 
     if n_valid == 0:
         return None
 
-    # Negate so higher = more confident (lower PAE = better)
-    scores = -(accumulated / n_valid)
+    scores = -(accumulated / n_valid).astype(np.float32)
     print(f"[trunk] pae_score range: [{scores.min():.3f}, {scores.max():.3f}]",
           file=sys.stderr)
     return scores
 
 
+# ── Normalisation ─────────────────────────────────────────────────────────────
+
 def normalise(arr):
-    """Normalise array to [0, 1]. Returns uniform 0.5 if all values identical."""
-    mn, mx = arr.min(), arr.max()
+    """Normalise float array to [0, 1]. Returns 0.5 uniformly if all identical."""
+    mn, mx = float(arr.min()), float(arr.max())
     if mx - mn < 1e-8:
-        return np.full_like(arr, 0.5)
-    return (arr - mn) / (mx - mn)
+        return np.full_like(arr, 0.5, dtype=np.float32)
+    return ((arr - mn) / (mx - mn)).astype(np.float32)
 
 
-def combine_scores(z_scores, pae_scores):
+# ── Combination ───────────────────────────────────────────────────────────────
+
+def combine_scores(z_scores, s_scores, plddt_var, pde_scores, pae_scores):
     """
-    Rank candidates by z score only.
-    PAE is loaded and printed for diagnostics but does not contribute to ranking.
-    Revert reason: PAE combination produced inferior IPSAE scores vs z-only.
-    To re-enable PAE: change to 0.5 * normalise(z_scores) + 0.5 * normalise(pae_scores)
+    Combined score:
+      0.60 * z_norm          (primary: pairformer interface encoding)
+      0.40 * (1 - plddt_norm) (flexibility: low pLDDT = disordered = good substitution target)
+
+    s, PDE and PAE are loaded and printed for diagnostics but not in the formula.
+    Falls back to z-only if mean pLDDT is unavailable.
     """
-    if z_scores is not None:
+    if z_scores is None:
+        # z unavailable — fall back through available signals
+        if s_scores is not None:
+            return normalise(s_scores), "s_fallback"
+        if pae_scores is not None:
+            return normalise(pae_scores), "pae_fallback"
+        return None, "fallback"
+
+    if plddt_var is not None:
+        # Use mean pLDDT across samples rather than variance —
+        # low mean pLDDT = disordered = good substitution target,
+        # so we invert: score = 1 - normalise(mean_plddt)
+        combined = 0.60 * normalise(z_scores) + 0.40 * (1.0 - normalise(plddt_var))
+        method   = "z_plddt_combined"
+    else:
         combined = normalise(z_scores)
         method   = "pair_emb_norm"
-    elif pae_scores is not None:
-        # Pure fallback — z embeddings unavailable
-        combined = normalise(pae_scores)
-        method   = "pae_fallback"
-    else:
-        combined = None
-        method   = "fallback"
 
-    return combined, method
+    return combined.astype(np.float32), method
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pred_dir",    required=True)
-    parser.add_argument("--binder_seq",  required=True)
-    parser.add_argument("--binder_len",  type=int, required=True)
-    parser.add_argument("--target_len",  type=int, required=True)
-    parser.add_argument("--candidates",  required=True)
-    parser.add_argument("--out",         required=True)
+    parser.add_argument("--pred_dir",   required=True)
+    parser.add_argument("--binder_seq", required=True)
+    parser.add_argument("--binder_len", type=int, required=True)
+    parser.add_argument("--target_len", type=int, required=True)
+    parser.add_argument("--candidates", required=True)
+    parser.add_argument("--out",        required=True)
     args = parser.parse_args()
 
-    candidates  = json.loads(args.candidates)
-    binder_len  = args.binder_len
-    target_len  = args.target_len
+    candidates = json.loads(args.candidates)
+    binder_len = args.binder_len
+    target_len = args.target_len
 
-    # Load both signals — PAE loaded for diagnostics even though not used in ranking
+    # Load all signals
     z_scores   = load_z_scores(args.pred_dir, binder_len, target_len)
-    pae_scores = load_pae_scores(args.pred_dir, binder_len, target_len)
+    s_scores   = load_s_scores(args.pred_dir, binder_len, target_len)
+    plddt_var  = load_plddt_variance(args.pred_dir, binder_len, target_len)
+    pde_scores = load_pde_scores(args.pred_dir, binder_len, target_len)     # diagnostic
+    pae_scores = load_pae_scores(args.pred_dir, binder_len, target_len)     # diagnostic
 
-    combined, method = combine_scores(z_scores, pae_scores)
+    combined, method = combine_scores(z_scores, s_scores, plddt_var,
+                                      pde_scores, pae_scores)
 
     if combined is not None:
         scores = {}
         for cand in candidates:
             pos = cand["design_idx"]
-            scores[str(pos)] = float(combined[pos]) if pos < len(combined) else 0.0
-            z_str   = f"{z_scores[pos]:.2f}"    if z_scores   is not None else "N/A"
-            pae_str = f"{-pae_scores[pos]:.2f}" if pae_scores is not None else "N/A"
-            print(f"[trunk] pos {pos} {cand['design_aa']}→{cand['known_aa']}: "
-                  f"combined={scores[str(pos)]:.4f}  z={z_str}  pae={pae_str}",
-                  file=sys.stderr)
+            if pos >= len(combined):
+                scores[str(pos)] = 0.0
+                continue
+
+            scores[str(pos)] = float(combined[pos])
+
+            z_str       = f"{z_scores[pos]:.3f}"      if z_scores   is not None else "N/A"
+            s_str       = f"{s_scores[pos]:.3f}"      if s_scores   is not None else "N/A"
+            pv_str      = f"{plddt_var[pos]:.4f}"     if plddt_var  is not None else "N/A"
+            pde_str     = f"{-pde_scores[pos]:.3f}"   if pde_scores is not None else "N/A"
+            pae_str     = f"{-pae_scores[pos]:.3f}"   if pae_scores is not None else "N/A"
+
+            print(
+                f"[trunk] pos {pos:3d} {cand['design_aa']}->{cand['known_aa']}: "
+                f"score={scores[str(pos)]:.4f}  "
+                f"z={z_str}  s={s_str}  plddt_var={pv_str}  "
+                f"pde={pde_str}  pae={pae_str}",
+                file=sys.stderr
+            )
     else:
         print("[trunk] no scoring signals available — using zero scores",
               file=sys.stderr)
@@ -170,8 +347,8 @@ def main():
 
     print(f"[trunk] method: {method}", file=sys.stderr)
 
-    with open(args.out, "w") as f:
-        json.dump({"scores": scores, "method": method}, f)
+    with open(args.out, "w") as fh:
+        json.dump({"scores": scores, "method": method}, fh)
 
     print(f"[trunk] wrote {len(scores)} scores via {method}", file=sys.stderr)
 
