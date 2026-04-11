@@ -25,7 +25,7 @@ Scoring formula per binder residue:
                     Complement to PAE for contact geometry confidence.
 
 Combined:
-  combined = 0.6 * z_norm + 0.4 * (1 - plddt_norm)
+  combined = 0.7 * z_norm + 0.3 * (1 - plddt_norm)
 
   PDE is loaded and printed for diagnostics but not yet in the formula.
   PAE is loaded and printed for diagnostics but not in the formula
@@ -135,7 +135,7 @@ def load_plddt_variance(pred_dir, binder_len, target_len):
     """
     Mean per-residue pLDDT across diffusion samples for binder residues.
     Lower mean pLDDT = more disordered = better substitution target.
-    Combined with z as: 0.60 * z + 0.40 * (1 - plddt_norm).
+    Combined with z as: 0.70 * z + 0.30 * (1 - plddt_norm).
     Returns float32 [binder_len] or None.
     Note: variable name kept as load_plddt_variance for API compatibility;
     now computes mean rather than variance.
@@ -264,8 +264,8 @@ def normalise(arr):
 def combine_scores(z_scores, s_scores, plddt_var, pde_scores, pae_scores):
     """
     Combined score:
-      0.60 * z_norm          (primary: pairformer interface encoding)
-      0.40 * (1 - plddt_norm) (flexibility: low pLDDT = disordered = good substitution target)
+      0.70 * z_norm          (primary: pairformer interface encoding)
+      0.30 * (1 - plddt_norm) (flexibility: low pLDDT = disordered = good substitution target)
 
     s, PDE and PAE are loaded and printed for diagnostics but not in the formula.
     Falls back to z-only if mean pLDDT is unavailable.
@@ -282,7 +282,7 @@ def combine_scores(z_scores, s_scores, plddt_var, pde_scores, pae_scores):
         # Use mean pLDDT across samples rather than variance —
         # low mean pLDDT = disordered = good substitution target,
         # so we invert: score = 1 - normalise(mean_plddt)
-        combined = 0.60 * normalise(z_scores) + 0.40 * (1.0 - normalise(plddt_var))
+        combined = 0.70 * normalise(z_scores) + 0.30 * (1.0 - normalise(plddt_var))
         method   = "z_plddt_combined"
     else:
         combined = normalise(z_scores)
